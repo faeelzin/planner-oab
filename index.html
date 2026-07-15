@@ -902,7 +902,9 @@ function applyStateData(data){
   if(data.sst) SST=data.sst;
   if(data.vardata) VARDATA=data.vardata;
   if(data.avisos) AVISOS=data.avisos;
-  if(data.rv) RV_ITEMS=data.rv;
+  // RV_ITEMS (revisões) é sincronizado à parte, um item por vez — ver rvLoadInitial()/rvStartRealtimeSync().
+  // Isso evita que uma escrita atrasada do restante do estado apague revisões adicionadas por outra pessoa.
+  if(!fbEnabled&&data.rv) RV_ITEMS=data.rv;
   if(data.discs&&data.discs.length){
     const defaultCodes=['CON','CO2','ADM','CIV','TRA','PDT','EMP','PEN','PPE','TRI'];
     DISCS=data.discs;
@@ -936,34 +938,106 @@ function renderAll(){
   rAv();
 }
 
+function fbDataForRoot(){
+  const data=buildStateData();
+  delete data.rv; // rv não vai no "pacote geral" — cada revisão é salva em seu próprio nó (ver rvPersistItem)
+  return data;
+}
+
 function save(){
   const data=buildStateData();
   const json=JSON.stringify(data);
   try{ localStorage.setItem(SK,json); }catch(e){ console.warn('localStorage save failed',e); }
   if(window.storage){ window.storage.set(SK,json).catch(function(){}); }
-  // Envia para o Firebase (com debounce curto para não disparar uma escrita a cada tecla)
+  // Envia para o Firebase (com debounce curto para não disparar uma escrita a cada tecla).
+  // Importante: os dados são remontados NA HORA em que o timer dispara (não no momento do clique),
+  // para nunca sobrescrever o servidor com um estado antigo/desatualizado.
   if(fbEnabled&&fbRef){
-    fbLastSentJson=json;
     if(fbSaveTimer) clearTimeout(fbSaveTimer);
     fbSaveTimer=setTimeout(function(){
-      fbRef.set(data).catch(function(e){ console.warn('Falha ao salvar no Firebase',e); });
+      const fresh=fbDataForRoot();
+      fbLastSentJson=JSON.stringify(fresh);
+      fbRef.update(fresh).catch(function(e){ console.warn('Falha ao salvar no Firebase',e); });
     },300);
   }
 }
 
 // Escuta alterações feitas por QUALQUER pessoa em tempo real e atualiza a tela na hora
+// (cards, cronograma, matérias, avisos — revisões têm sua própria sincronização, ver rvStartRealtimeSync)
 function startRealtimeSync(){
   if(!fbEnabled||!fbRef)return;
   fbRef.on('value',function(snapshot){
-    const data=snapshot.val();
-    if(!data)return;
+    const raw=snapshot.val();
+    if(!raw)return;
+    const data=Object.assign({},raw);
+    delete data.rv;
     const json=JSON.stringify(data);
     if(json===fbLastSentJson)return; // já é o que a própria pessoa acabou de enviar
     applyStateData(data);
-    try{ localStorage.setItem(SK,json); }catch(e){}
     fbLastSentJson=json;
     renderAll();
   });
+}
+
+// ── SINCRONIZAÇÃO GRANULAR DAS REVISÕES ──
+// Cada revisão é um "nó" independente no Firebase (chave = id da revisão), em vez de
+// fazer parte de um array único sobrescrito por inteiro a cada salvamento. Assim, adicionar/editar
+// uma revisão nunca apaga revisões que outra pessoa (ou outra aba) acabou de criar.
+function rvArrayFromMap(map){
+  if(!map) return [];
+  const arr=Array.isArray(map)?map.filter(Boolean):Object.keys(map).map(function(k){return map[k];});
+  return arr.filter(Boolean).sort(function(a,b){return (b.id||0)-(a.id||0);});
+}
+function rvPersistItem(item){
+  if(!fbEnabled||!fbRef||!item||item.id==null)return;
+  fbRef.child('rv').child(String(item.id)).set(item).catch(function(e){ console.warn('Falha ao sincronizar revisão no Firebase',e); });
+}
+function rvPersistDelete(id){
+  if(!fbEnabled||!fbRef)return;
+  fbRef.child('rv').child(String(id)).remove().catch(function(e){ console.warn('Falha ao excluir revisão no Firebase',e); });
+}
+let fbRvLastSentJson=null;
+function rvStartRealtimeSync(){
+  if(!fbEnabled||!fbRef)return;
+  fbRef.child('rv').on('value',function(snapshot){
+    const items=rvArrayFromMap(snapshot.val());
+    const json=JSON.stringify(items);
+    if(json===fbRvLastSentJson)return;
+    RV_ITEMS=items;
+    fbRvLastSentJson=json;
+    const rvTab=document.getElementById('tp-revisoes');
+    if(rvTab&&rvTab.classList.contains('active')) rvRender();
+  });
+}
+async function rvLoadInitial(localData){
+  if(fbEnabled&&fbRef){
+    try{
+      const snap=await fbRef.child('rv').once('value');
+      const val=snap.val();
+      if(Array.isArray(val)&&val.length){
+        // Formato antigo (um array só, sobrescrito por inteiro) → migra para 1 nó por revisão
+        const map={};
+        val.filter(Boolean).forEach(function(it){ if(it&&it.id!=null) map[String(it.id)]=it; });
+        await fbRef.child('rv').set(map);
+        RV_ITEMS=rvArrayFromMap(map);
+      } else if(val&&!Array.isArray(val)){
+        RV_ITEMS=rvArrayFromMap(val);
+      } else if(localData&&localData.rv&&localData.rv.length){
+        const map={};
+        localData.rv.forEach(function(it){ if(it&&it.id!=null) map[String(it.id)]=it; });
+        RV_ITEMS=rvArrayFromMap(map);
+        fbRef.child('rv').set(map).catch(function(){});
+      } else {
+        RV_ITEMS=[];
+      }
+      fbRvLastSentJson=JSON.stringify(RV_ITEMS);
+    }catch(e){
+      console.warn('Falha ao carregar revisões do Firebase, usando dados locais.',e);
+      if(localData&&localData.rv) RV_ITEMS=localData.rv;
+    }
+  } else if(localData&&localData.rv){
+    RV_ITEMS=localData.rv;
+  }
 }
 
 async function load(){
@@ -1018,14 +1092,16 @@ async function load(){
     if(fbEnabled&&fbRef){
       try{
         const snap=await fbRef.once('value');
-        if(!snap.exists()) fbRef.set(buildStateData()).catch(function(){});
+        if(!snap.exists()) fbRef.update(fbDataForRoot()).catch(function(){});
       }catch(e){}
     }
   } else {
     initC();
-    if(fbEnabled&&fbRef) fbRef.set(buildStateData()).catch(function(){});
+    if(fbEnabled&&fbRef) fbRef.update(fbDataForRoot()).catch(function(){});
   }
+  await rvLoadInitial(data);
   startRealtimeSync();
+  rvStartRealtimeSync();
 }
 
 function initC(){CARDS=[];let id=1;WT.forEach((wk,wi)=>{wk.forEach((day,di)=>{day.forEach(c=>{CARDS.push({id:id++,wk:wi+1,dy:di,mt:c.m,tp:c.t,inc:c.i,me:c.me,hr:c.h,st:'nao'});});});});}
@@ -1726,8 +1802,9 @@ function rvAdd(){
   var firstRevDate=firstRevEl&&firstRevEl.value ? rvISOToMs(firstRevEl.value) : null;
   var steps=RV_STEPS.map(function(){ return {doneAt:null,targetDate:null}; });
   if(firstRevDate) steps[0].targetDate=firstRevDate;
-  RV_ITEMS.unshift({id:Date.now(),topic:topic,disc:disc,note:note,studiedAt:studiedAt,steps:steps});
-  rvSave();
+  var newItem={id:Date.now(),topic:topic,disc:disc,note:note,studiedAt:studiedAt,steps:steps};
+  RV_ITEMS.unshift(newItem);
+  rvSave(); rvPersistItem(newItem);
   document.getElementById('rvTopic').value='';
   document.getElementById('rvNote').value='';
   document.getElementById('rvDisc').value='';
@@ -1740,13 +1817,13 @@ function rvMarkStep(id,stepIdx){
   var item=RV_ITEMS.find(function(x){ return x.id===id; }); if(!item) return;
   if(rvNextStep(item)!==stepIdx) return;
   item.steps[stepIdx].doneAt=rvToday();
-  rvSave(); rvRender();
+  rvSave(); rvPersistItem(item); rvRender();
 }
 
 function rvUndoStep(id,stepIdx){
   var item=RV_ITEMS.find(function(x){ return x.id===id; }); if(!item) return;
   if(item.steps[stepIdx]) item.steps[stepIdx].doneAt=null;
-  rvSave(); rvRender();
+  rvSave(); rvPersistItem(item); rvRender();
 }
 
 function rvResetCycle(id){
@@ -1775,14 +1852,14 @@ function rvConfirmReset(id){
   var newStart=dateEl&&dateEl.value ? rvISOToMs(dateEl.value) : rvToday();
   item.studiedAt=newStart;
   item.steps=RV_STEPS.map(function(){ return {doneAt:null,targetDate:null}; });
-  rvSave(); rvRender();
+  rvSave(); rvPersistItem(item); rvRender();
 }
 
 function rvDelete(id){
   var btn=document.getElementById('rvdel-'+id); if(!btn) return;
   if(btn.dataset.armed==='1'){
     RV_ITEMS=RV_ITEMS.filter(function(x){ return x.id!==id; });
-    rvSave(); rvRender(); return;
+    rvSave(); rvPersistDelete(id); rvRender(); return;
   }
   btn.dataset.armed='1'; btn.textContent='Confirmar?'; btn.style.color='#dc2626'; btn.style.borderColor='#fca5a5';
   setTimeout(function(){ if(btn){ btn.dataset.armed='0'; btn.textContent='🗑'; btn.style.color=''; btn.style.borderColor=''; } },3000);
@@ -1796,12 +1873,12 @@ function rvAddComment(id){
   if(!txt) return;
   if(!item.comments) item.comments=[];
   item.comments.unshift({id:Date.now(),txt:txt,date:new Date().toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'})});
-  rvSave(); rvRender();
+  rvSave(); rvPersistItem(item); rvRender();
 }
 function rvDelComment(id,cid){
   var item=RV_ITEMS.find(function(x){ return x.id===id; }); if(!item||!item.comments) return;
   item.comments=item.comments.filter(function(c){ return c.id!==cid; });
-  rvSave(); rvRender();
+  rvSave(); rvPersistItem(item); rvRender();
 }
 
 // ── EDITAR REVISÃO ──
@@ -1859,7 +1936,7 @@ function rvSaveEdit(){
       item.steps[i].targetDate=ms;
     }
   });
-  rvSave(); rvCloseEdit(); rvRender();
+  rvSave(); rvPersistItem(item); rvCloseEdit(); rvRender();
 }
 
 function rvRender(){
